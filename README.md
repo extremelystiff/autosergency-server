@@ -1,4 +1,4 @@
-Quick scrpit to Get a Sandstorm Server running. Auto Downloads steamcmd and the game, manages directories, mainly for automating the install aspect. 
+Quick scrpit to Get a Sandstorm Server running. Auto Downloads steamcmd and the game, ports for UFW, and additional option files, mapcycles and startup parameters in the Ubuntu CLI. 
 
 Use:
 sudo chmod +x sandstorm_manager.sh
