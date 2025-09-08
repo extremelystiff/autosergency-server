@@ -2,8 +2,8 @@
 
 #================================================================
 # Insurgency: Sandstorm - Linux Server Management Script
-# Author: ExtremelyStiff
-# Version: 1.7 - Enhanced Preset Editor (Stats, Rules, Mutators)
+# Author: AI Assistant
+# Version: 1.8 - Added Watchdog Functionality
 #================================================================
 
 # --- Script Configuration ---
@@ -15,6 +15,12 @@ SERVER_DIR="$HOME/sandstorm_server"
 PRESETS_FILE="$HOME/sandstorm_presets.conf"
 APP_ID="581330" # App ID for server download
 SESSION_NAME="sandstorm"
+
+# --- Watchdog Configuration ---
+WATCHDOG_PID_FILE="$HOME/.sandstorm_watchdog.pid"
+LAST_LAUNCHED_PRESET_FILE="$HOME/.sandstorm_last_launched_preset.txt"
+WATCHDOG_LOG_FILE="$HOME/sandstorm_watchdog.log"
+WATCHDOG_CHECK_INTERVAL=30 # Seconds
 
 # --- Color Codes for UI ---
 GREEN='\033[0;32m'
@@ -273,55 +279,18 @@ Scenario_Forest_Outpost
 EOF
 )
 
-# --- Mutator List ---
-# Based on the "Mutator Name" column from the provided documentation
-# Descriptions can be added to an associative array if complex display is needed later.
+# --- Mutator List (unchanged) ---
 MUTATOR_LIST_NAMES=(
-    "All You Can Eat"
-    "Anti-Materiel Only"
-    "Bolt-Actions Only"
-    "Arm's Race"
-    "Broke"
-    "Budget Antiquing"
-    "Bullet Sponge"
-    "Competitive"
-    "Competitive Loadouts"
-    "Desert Eagles Only"
-    "Fast Movement"
-    "Frenzy"
-    "Fully Loaded"
-    "Grenade Launchers Only"
-    "Guerrillas"
-    "Gunslingers"
-    "Hardcore"
-    "Headshots Only"
-    "Hot Potato"
-    "First Blood" # LMGOnly
-    "Locked Aim"
-    "Makarovs Only"
-    "No Aim Down Sights"
-    "No Death Camera"
-    "No Drops"
-    "No Third Person"
-    "Official Rules" # Also a mutator name
-    "Pistols Only"
-    "Poor"
-    "Shotguns Only"
-    "Slow Capture Times"
-    "Slow Movement"
-    "Small Firefight"
-    "Soldier of Fortune"
-    "Special Operations"
-    "Strapped"
-    "Tactical Voice Chat"
-    "Tie Breaker"
-    "Ultralethal"
-    "Vampirism"
-    "Warlords"
-    "WELRODS!"
-    "Welrods Only"
+    "All You Can Eat" "Anti-Materiel Only" "Bolt-Actions Only" "Arm's Race" "Broke"
+    "Budget Antiquing" "Bullet Sponge" "Competitive" "Competitive Loadouts" "Desert Eagles Only"
+    "Fast Movement" "Frenzy" "Fully Loaded" "Grenade Launchers Only" "Guerrillas"
+    "Gunslingers" "Hardcore" "Headshots Only" "Hot Potato" "First Blood" # LMGOnly
+    "Locked Aim" "Makarovs Only" "No Aim Down Sights" "No Death Camera" "No Drops"
+    "No Third Person" "Official Rules" "Pistols Only" "Poor" "Shotguns Only"
+    "Slow Capture Times" "Slow Movement" "Small Firefight" "Soldier of Fortune"
+    "Special Operations" "Strapped" "Tactical Voice Chat" "Tie Breaker" "Ultralethal"
+    "Vampirism" "Warlords" "WELRODS!" "Welrods Only"
 )
-
 
 # --- Helper Functions (mostly unchanged, some new ones for presets) ---
 command_exists() { command -v "$1" >/dev/null 2>&1; }
@@ -429,7 +398,7 @@ update_sandstorm() {
 }
 
 
-# --- Server Management (select_preset and start_server slightly adjusted for sourcing) ---
+# --- Server Management ---
 is_server_running() {
     if [[ "$MULTIPLEXER" == "tmux" ]]; then
         tmux has-session -t "$SESSION_NAME" 2>/dev/null
@@ -442,67 +411,121 @@ select_preset() {
     if [ ! -f "$PRESETS_FILE" ]; then echo -e "${RED}Presets file not found! Please create it first (Option 7 -> Create or Manually Edit).${NC}"; return 1; fi
     local selected_preset_name_to_return=""
     ( # Subshell to isolate sourcing
-      # Ensure preset arrays are loaded from the file for selection
-      # This local sourcing won't affect the parent shell's preset arrays used by the manager
+      # shellcheck source=/dev/null
       source "$PRESETS_FILE"
       mapfile -t presets < <(compgen -v | grep '_args$' | sed 's/_args$//' | sort)
 
-      if [ ${#presets[@]} -eq 0 ]; then echo -e "${RED}No valid presets found in $PRESETS_FILE. Ensure they end with '_args'.${NC}"; return 1; fi
+      if [ ${#presets[@]} -eq 0 ]; then echo -e "${RED}No valid presets found in $PRESETS_FILE. Ensure they end with '_args'.${NC}" >&2; return 1; fi
 
       echo -e "${YELLOW}Select a startup preset:${NC}" >&2
       local selected_preset_name
       PS3="Select a preset: "
       select preset_name_opt in "${presets[@]}"; do
           if [[ -n "$preset_name_opt" ]]; then
-              selected_preset_name_to_return="${preset_name_opt}_args" # This is what will be echoed
+              selected_preset_name_to_return="${preset_name_opt}_args"
               break
           else
-              echo -e "${RED}Invalid selection.${NC}"
-              PS3="Enter your choice: " # Reset PS3
-              return 1 # Error from subshell
+              echo -e "${RED}Invalid selection.${NC}" >&2
+              # PS3 already set, no need to reset here for select loop
+              return 1 # Error from subshell due to invalid choice leading to loop break
           fi
       done
-      PS3="Enter your choice: " # Reset PS3
+      PS3="Enter your choice: " # Reset PS3 for main script
       echo "$selected_preset_name_to_return" # Echo the chosen name for capture by caller
       return 0 # Success from subshell
-    ) || return 1 # Propagate failure from subshell (e.g., if no presets found or user cancels)
+    ) || return 1 # Propagate failure from subshell
 }
 
+_start_server_core() {
+    local preset_array_name="$1"
+    local log_prefix="$(date): [_start_server_core]"
+
+    if [[ -z "$preset_array_name" ]]; then
+        echo -e "${RED}Error: _start_server_core called without preset_array_name.${NC}" | tee -a "$WATCHDOG_LOG_FILE"
+        return 1
+    fi
+
+    if ! declare -p "$preset_array_name" &>/dev/null; then
+        if [ -f "$PRESETS_FILE" ]; then
+            # shellcheck source=/dev/null
+            source "$PRESETS_FILE"
+            if [ $? -ne 0 ]; then
+                echo "$log_prefix ${RED}Error sourcing $PRESETS_FILE. Check for syntax errors.${NC}" | tee -a "$WATCHDOG_LOG_FILE"
+                return 1
+            fi
+        else
+            echo "$log_prefix ${RED}Error: Presets file $PRESETS_FILE not found.${NC}" | tee -a "$WATCHDOG_LOG_FILE"
+            return 1
+        fi
+
+        if ! declare -p "$preset_array_name" &>/dev/null; then
+            echo "$log_prefix ${RED}Error: Preset array '$preset_array_name' still not found after sourcing.${NC}" | tee -a "$WATCHDOG_LOG_FILE"
+            return 1
+        fi
+    fi
+    declare -n args_array="$preset_array_name" # Bash 4.3+ nameref
+
+    if ! cd "$SERVER_DIR"; then
+        echo "$log_prefix ${RED}CRITICAL: Failed to cd to $SERVER_DIR for preset $preset_array_name${NC}" | tee -a "$WATCHDOG_LOG_FILE"
+        return 1
+    fi
+
+    echo "$log_prefix Launching server with preset '${preset_array_name/_args/}'..." | tee -a "$WATCHDOG_LOG_FILE"
+    local server_binary="./Insurgency/Binaries/Linux/InsurgencyServer-Linux-Shipping"
+    if [ ! -x "$server_binary" ]; then
+        echo "$log_prefix ${RED}CRITICAL: Server binary $server_binary not found or not executable.${NC}" | tee -a "$WATCHDOG_LOG_FILE"
+        return 1
+    fi
+
+    if [[ "$MULTIPLEXER" == "tmux" ]]; then
+        tmux new-session -s "$SESSION_NAME" -d "$server_binary" "${args_array[@]}"
+    else
+        local cmd_string="$server_binary"
+        for arg in "${args_array[@]}"; do cmd_string+=" \"$arg\""; done
+        screen -S "$SESSION_NAME" -dm bash -c "$cmd_string"
+    fi
+
+    sleep 5 # Give it a moment to actually start
+    if is_server_running; then
+        echo "$log_prefix Server confirmed running after launch attempt." | tee -a "$WATCHDOG_LOG_FILE"
+    else
+        echo "$log_prefix ${RED}Server FAILED to start after launch attempt. Check server logs in $SERVER_DIR/Insurgency/Saved/Logs/${NC}" | tee -a "$WATCHDOG_LOG_FILE"
+        return 1 # Indicate failure to start
+    fi
+    return 0
+}
 
 start_server() {
     if is_server_running; then echo -e "${RED}Server is already running!${NC}"; return; fi
+    if [ -f "$WATCHDOG_PID_FILE" ]; then
+        local wd_pid
+        wd_pid=$(cat "$WATCHDOG_PID_FILE")
+        if ps -p "$wd_pid" > /dev/null; then
+            echo -e "${RED}Watchdog is active (PID: $wd_pid).${NC}"
+            echo -e "${YELLOW}Please use 'Stop Server & Watchdog' (Option 2W) if you wish to manage the server differently.${NC}"
+            return
+        else # Stale PID file
+            echo -e "${YELLOW}Stale watchdog PID file found ($WATCHDOG_PID_FILE). Process $wd_pid not running. Removing file.${NC}"
+            rm -f "$WATCHDOG_PID_FILE" "$LAST_LAUNCHED_PRESET_FILE" # Clean up related file too
+        fi
+    fi
 
     local preset_array_name
-    preset_array_name=$(select_preset) # Capture echoed name
+    preset_array_name=$(select_preset)
     if [[ $? -ne 0 || -z "$preset_array_name" ]]; then
         echo -e "${RED}Preset selection cancelled or failed.${NC}"
         return
     fi
 
+    echo -e "${GREEN}Starting server (manual mode) with preset '${preset_array_name/_args/}'...${NC}"
+    _start_server_core "$preset_array_name"
+    local start_status=$?
 
-    # Source the presets file in the CURRENT shell to make the specific array accessible by nameref
-    # This is important for declare -n to find the array.
-    # The manage_startup_presets function handles its own global sourcing.
-    source "$PRESETS_FILE"
-    if ! declare -p "$preset_array_name" &>/dev/null; then
-        echo -e "${RED}Error: Preset array '$preset_array_name' not found after sourcing. Check $PRESETS_FILE.${NC}"
-        return
-    fi
-    declare -n args_array="$preset_array_name" # Bash 4.3+ nameref
-
-    cd "$SERVER_DIR" || exit
-
-    echo -e "${GREEN}Starting server with preset '${preset_array_name/_args/}'...${NC}"
-    if [[ "$MULTIPLEXER" == "tmux" ]]; then
-        tmux new-session -s "$SESSION_NAME" -d "./Insurgency/Binaries/Linux/InsurgencyServer-Linux-Shipping" "${args_array[@]}"
+    if [ $start_status -eq 0 ]; then
+        echo -e "${GREEN}Server started successfully (manual mode).${NC}"
     else
-        local cmd_string="./Insurgency/Binaries/Linux/InsurgencyServer-Linux-Shipping"
-        for arg in "${args_array[@]}"; do cmd_string+=" \"$arg\""; done
-        screen -S "$SESSION_NAME" -dm bash -c "$cmd_string"
+        echo -e "${RED}Server failed to start (manual mode). Use Test-Run or check logs ($WATCHDOG_LOG_FILE and server logs).${NC}"
     fi
-
-    sleep 2
-    if is_server_running; then echo -e "${GREEN}Server started successfully.${NC}"; else echo -e "${RED}Server failed to start. Use the Test-Run option to debug.${NC}"; fi
 }
 
 test_run_server() {
@@ -515,14 +538,23 @@ test_run_server() {
         return
     fi
 
-    source "$PRESETS_FILE"
     if ! declare -p "$preset_array_name" &>/dev/null; then
-        echo -e "${RED}Error: Preset array '$preset_array_name' not found after sourcing. Check $PRESETS_FILE.${NC}"
-        return
+        if [ -f "$PRESETS_FILE" ]; then
+            # shellcheck source=/dev/null
+            source "$PRESETS_FILE"
+             if [ $? -ne 0 ]; then echo -e "${RED}Error sourcing $PRESETS_FILE in test_run. Check syntax.${NC}"; return 1; fi
+        else
+            echo -e "${RED}Error: Presets file $PRESETS_FILE not found by test_run_server.${NC}"
+            return 1
+        fi
+        if ! declare -p "$preset_array_name" &>/dev/null; then
+            echo -e "${RED}Error: Preset array '$preset_array_name' still not found after sourcing in test_run_server.${NC}"
+            return 1
+        fi
     fi
     declare -n args_array="$preset_array_name"
 
-    cd "$SERVER_DIR" || exit
+    if ! cd "$SERVER_DIR"; then echo -e "${RED}Failed to cd to $SERVER_DIR${NC}"; return 1; fi
 
     clear
     echo -e "${YELLOW}--- TEST RUN ---${NC}"
@@ -552,36 +584,204 @@ test_run_server() {
     if [ $exit_code -ne 0 ]; then
         echo -e "${RED}DEBUG: Server exited with an error code! Check for messages above.${NC}"
     else
-        echo -e "${GREEN}DEBUG: Server exited cleanly (code 0), but it should have stayed running if configured correctly.${NC}"
+        echo -e "${GREEN}DEBUG: Server exited cleanly (code 0).${NC}"
     fi
     echo -e "\n${YELLOW}--- TEST RUN COMPLETE ---${NC}"
 }
 
-stop_server() { # Unchanged
+stop_server() {
     if ! is_server_running; then echo -e "${RED}Server is not running.${NC}"; return; fi
-    echo -e "${YELLOW}Stopping server...${NC}"
+
+    if [ -f "$WATCHDOG_PID_FILE" ]; then
+        local wd_pid
+        wd_pid=$(cat "$WATCHDOG_PID_FILE")
+        if ps -p "$wd_pid" > /dev/null; then
+             echo -e "${YELLOW}Watchdog is active (PID: $wd_pid). Server will likely be restarted by it.${NC}"
+             echo -e "${YELLOW}To stop both, use 'Stop Server & Watchdog' (Option 2W).${NC}"
+        fi
+    fi
+
+    echo -e "${YELLOW}Stopping server session '$SESSION_NAME'...${NC}"
     if [[ "$MULTIPLEXER" == "tmux" ]]; then
-        tmux kill-session -t "$SESSION_NAME"
+        tmux kill-session -t "$SESSION_NAME" 2>/dev/null
     else
-        screen -S "$SESSION_NAME" -X quit
+        screen -S "$SESSION_NAME" -X quit 2>/dev/null
     fi
-    echo -e "${GREEN}Server stopped.${NC}"
+    sleep 1
+    if ! is_server_running; then
+        echo -e "${GREEN}Server session stopped.${NC}"
+    else
+        echo -e "${RED}Failed to stop server session, or it was restarted quickly.${NC}"
+    fi
 }
-status_server() { # Unchanged
+
+status_server() {
+    local server_status_msg=""
     if is_server_running; then
-        echo -e "Server Status: ${GREEN}ONLINE${NC} (using $MULTIPLEXER)"
+        server_status_msg="Server Status: ${GREEN}ONLINE${NC} (using $MULTIPLEXER, session: $SESSION_NAME)"
     else
-        echo -e "Server Status: ${RED}OFFLINE${NC}"
+        server_status_msg="Server Status: ${RED}OFFLINE${NC}"
     fi
+
+    if [ -f "$WATCHDOG_PID_FILE" ]; then
+        local pid
+        pid=$(cat "$WATCHDOG_PID_FILE")
+        if ps -p "$pid" > /dev/null; then
+            local preset_info="N/A"
+            if [ -f "$LAST_LAUNCHED_PRESET_FILE" ]; then preset_info=$(cat "$LAST_LAUNCHED_PRESET_FILE"); fi
+            server_status_msg+="\nWatchdog Status: ${GREEN}ACTIVE${NC} (PID: $pid, Preset: ${preset_info/_args/})"
+        else
+            server_status_msg+="\nWatchdog Status: ${RED}INACTIVE${NC} (PID file found but process $pid dead. Consider removing $WATCHDOG_PID_FILE)"
+        fi
+    else
+        server_status_msg+="\nWatchdog Status: ${CYAN}NOT ACTIVE${NC}"
+    fi
+    echo -e "$server_status_msg"
 }
+
 view_console() { # Unchanged
     if ! is_server_running; then echo -e "${RED}Server is not running. Cannot view console.${NC}"; return; fi
     if [[ "$MULTIPLEXER" == "tmux" ]]; then
-        echo -e "${YELLOW}Attaching to tmux session... Press CTRL+B then D to detach.${NC}"
+        echo -e "${YELLOW}Attaching to tmux session '$SESSION_NAME'... Press CTRL+B then D to detach.${NC}"
         tmux attach-session -t "$SESSION_NAME"
     else
-        echo -e "${YELLOW}Attaching to screen session... Press CTRL+A then D to detach.${NC}"
+        echo -e "${YELLOW}Attaching to screen session '$SESSION_NAME'... Press CTRL+A then D to detach.${NC}"
         screen -r "$SESSION_NAME"
+    fi
+}
+
+# --- Watchdog Specific Functions ---
+_actual_watchdog_loop() {
+    local preset_to_use="$1"
+    local log_prefix="$(date): [WatchdogLoop]"
+
+    echo "$log_prefix Watchdog loop started. Monitoring server with preset: ${preset_to_use/_args/}" >> "$WATCHDOG_LOG_FILE"
+
+    if ! is_server_running; then
+        echo "$log_prefix Server not running at watchdog init. Attempting initial start." >> "$WATCHDOG_LOG_FILE"
+        _start_server_core "$preset_to_use"
+        # Give server some time to initialize fully before first check cycle
+        sleep $((WATCHDOG_CHECK_INTERVAL > 15 ? WATCHDOG_CHECK_INTERVAL : 15))
+    else
+        echo "$log_prefix Server already running when watchdog loop initialized." >> "$WATCHDOG_LOG_FILE"
+    fi
+
+    while true; do
+        sleep "$WATCHDOG_CHECK_INTERVAL"
+        
+        if ! is_server_running; then
+            echo "$log_prefix SERVER OFFLINE. Watchdog restarting with preset: ${preset_to_use/_args/}" >> "$WATCHDOG_LOG_FILE"
+            # Attempt to clean any lingering session first, just in case.
+            if [[ "$MULTIPLEXER" == "tmux" ]]; then
+                tmux kill-session -t "$SESSION_NAME" 2>/dev/null
+            else
+                screen -S "$SESSION_NAME" -X quit 2>/dev/null
+            fi
+            sleep 2 # Brief pause
+
+            _start_server_core "$preset_to_use"
+            # Wait a bit longer after a restart attempt before checking again to avoid rapid restart logs if server is unstable
+            sleep $((WATCHDOG_CHECK_INTERVAL > 10 ? WATCHDOG_CHECK_INTERVAL + 5 : 15))
+        # else
+            # echo "$log_prefix Server online. Watchdog check passed." >> "$WATCHDOG_LOG_FILE" # Can be too verbose
+        fi
+    done
+}
+
+start_server_with_watchdog() {
+    if is_server_running; then
+        echo -e "${RED}Server is already running!${NC}"
+        if [ -f "$WATCHDOG_PID_FILE" ]; then
+            local wd_pid; wd_pid=$(cat "$WATCHDOG_PID_FILE")
+            if ps -p "$wd_pid" > /dev/null; then
+                 echo -e "${YELLOW}Watchdog appears to be active (PID: $wd_pid). Stop it first (Option 2W).${NC}"
+                 return
+            fi
+        fi
+        echo -e "${YELLOW}If it's a manual start, stop it first (Option 2).${NC}"
+        return
+    fi
+
+    if [ -f "$WATCHDOG_PID_FILE" ]; then
+         local wd_pid; wd_pid=$(cat "$WATCHDOG_PID_FILE")
+         if ps -p "$wd_pid" > /dev/null; then
+            echo -e "${RED}Watchdog is already running (PID: $wd_pid). Please stop it first (Option 2W).${NC}"
+            return
+        else
+            echo -e "${YELLOW}Stale watchdog PID file found ($WATCHDOG_PID_FILE for dead PID $wd_pid). Cleaning up...${NC}"
+            rm -f "$WATCHDOG_PID_FILE" "$LAST_LAUNCHED_PRESET_FILE"
+        fi
+    fi
+
+    local preset_array_name
+    preset_array_name=$(select_preset)
+    if [[ $? -ne 0 || -z "$preset_array_name" ]]; then
+        echo -e "${RED}Preset selection cancelled or failed. Watchdog not started.${NC}"
+        return
+    fi
+
+    echo "$preset_array_name" > "$LAST_LAUNCHED_PRESET_FILE"
+    echo -e "${GREEN}Starting server with watchdog for preset '${preset_array_name/_args/}'...${NC}"
+    # Initialize/overwrite watchdog log for this run
+    echo "$(date): [WatchdogManager] Watchdog initiated by user for preset $preset_array_name" > "$WATCHDOG_LOG_FILE"
+
+    # Launch the watchdog loop in the background. It will perform the initial start.
+    ( _actual_watchdog_loop "$preset_array_name" >> "$WATCHDOG_LOG_FILE" 2>&1 ) &
+    local watchdog_pid=$!
+    echo "$watchdog_pid" > "$WATCHDOG_PID_FILE"
+
+    echo -e "${YELLOW}Watchdog process launched (PID: $watchdog_pid). Waiting for initial server start...${NC}"
+    sleep 7 # Give watchdog time for the initial _start_server_core call (which itself sleeps 5s)
+
+    if is_server_running; then
+        echo -e "${GREEN}Server started by watchdog successfully.${NC}"
+        echo -e "${CYAN}Watchdog is now monitoring the server. Log: $WATCHDOG_LOG_FILE${NC}"
+        echo -e "${YELLOW}To stop the server AND the watchdog, use 'Stop Server & Watchdog' (Option 2W).${NC}"
+    else
+        echo -e "${RED}Server failed to start via watchdog after initial attempt.${NC}"
+        echo -e "${RED}Check $WATCHDOG_LOG_FILE and server logs in $SERVER_DIR/Insurgency/Saved/Logs/${NC}"
+        # If server failed this initial start, kill the watchdog we just launched and clean up
+        if ps -p $watchdog_pid > /dev/null; then
+            echo -e "${YELLOW}Stopping the failed watchdog process (PID: $watchdog_pid)...${NC}"
+            kill "$watchdog_pid"
+        fi
+        rm -f "$WATCHDOG_PID_FILE" "$LAST_LAUNCHED_PRESET_FILE"
+    fi
+}
+
+stop_watchdog_and_server() {
+    local watchdog_was_killed=false
+    if [ -f "$WATCHDOG_PID_FILE" ]; then
+        local pid_to_kill
+        pid_to_kill=$(cat "$WATCHDOG_PID_FILE")
+        if [[ -n "$pid_to_kill" ]] && ps -p "$pid_to_kill" > /dev/null; then
+            echo -e "${YELLOW}Stopping watchdog (PID: $pid_to_kill)...${NC}"
+            kill "$pid_to_kill"
+            sleep 1
+            if ps -p "$pid_to_kill" > /dev/null; then
+                 echo -e "${RED}Watchdog (PID: $pid_to_kill) did not stop gracefully, sending SIGKILL...${NC}"
+                 kill -9 "$pid_to_kill"
+            fi
+            echo "$(date): [WatchdogManager] Watchdog process $pid_to_kill stopped by user." >> "$WATCHDOG_LOG_FILE"
+            watchdog_was_killed=true
+        else
+            echo -e "${YELLOW}Watchdog PID file found, but process $pid_to_kill not running or PID is empty.${NC}"
+        fi
+        rm -f "$WATCHDOG_PID_FILE"
+    else
+        echo -e "${CYAN}No active watchdog PID file found. Watchdog was not running or not managed by this script.${NC}"
+    fi
+
+    if [[ "$watchdog_was_killed" == "true" ]]; then
+        rm -f "$LAST_LAUNCHED_PRESET_FILE"
+        echo -e "${GREEN}Watchdog stopped and its files cleaned up.${NC}"
+    fi
+
+    if is_server_running; then
+        echo -e "${YELLOW}Now stopping the server session...${NC}"
+        stop_server # This will call the regular stop_server logic
+    else
+        echo -e "${CYAN}Server is not currently running.${NC}"
     fi
 }
 
@@ -852,7 +1052,6 @@ generate_map_cycle() {
 }
 
 # START: Advanced Preset Management Functions (Helpers mostly unchanged)
-
 _parse_map_string_to_assoc() {
     local map_string="$1"; local -n params_ref="$2"; params_ref=()
     IFS='?' read -r first_part rest_params <<< "$map_string"; params_ref["_MAP_NAME_"]="$first_part"
@@ -898,12 +1097,12 @@ _set_arg_in_array() {
 _remove_arg_from_array() {
     local -n arr_ref="$1"; local arg_to_remove_pattern="$2"; local exact_match="${3:-false}"
     local index=$(_find_arg_index_in_array "$1" "$arg_to_remove_pattern" "$exact_match")
-    if [[ $index -ne -1 ]]; then unset 'arr_ref[$index]'; return 0; fi; return 1
+    if [[ $index -ne -1 ]]; then unset 'arr_ref[$index]'; arr_ref=("${arr_ref[@]}"); return 0; fi; return 1 # Re-index array
 }
 _toggle_flag_in_array() {
     local -n arr_ref="$1"; local flag_arg="$2"
     local index=$(_find_arg_index_in_array "$1" "$flag_arg" "true")
-    if [[ $index -ne -1 ]]; then unset 'arr_ref[$index]'; echo "'$flag_arg' disabled."; else arr_ref+=("$flag_arg"); echo "'$flag_arg' enabled."; fi
+    if [[ $index -ne -1 ]]; then unset 'arr_ref[$index]'; arr_ref=("${arr_ref[@]}"); echo "'$flag_arg' disabled."; else arr_ref+=("$flag_arg"); echo "'$flag_arg' enabled."; fi # Re-index array
 }
 _select_file_from_server_config_dir() {
     local prompt_msg="$1"; local default_filename="${2:-}"; local selected_file=""
@@ -924,9 +1123,8 @@ _select_file_from_server_config_dir() {
     if [[ -z "$selected_file" && -n "$default_filename" && "$fname" != "Clear/None" ]]; then echo "$default_filename"; else echo "$selected_file"; fi
 }
 
-# NEW HELPER: Manage Mutators for a preset
 _manage_mutators_for_preset() {
-    local -n preset_args_ref="$1" # Nameref to the preset's argument array
+    local -n preset_args_ref="$1"
     local current_mutators_str=$(_get_arg_value_from_array preset_args_ref "-mutators=")
     declare -a selected_mutators_arr=()
 
@@ -952,20 +1150,14 @@ _manage_mutators_for_preset() {
         read -rp "Mutator option: " mutator_choice
 
         case "$mutator_choice" in
-            1) # Add Mutator
+            1)
                 local available_mutators_to_add=()
                 for mut_name in "${MUTATOR_LIST_NAMES[@]}"; do
-                     # Check if mutator is already selected
                     local found=0
-                    for sel_mut in "${selected_mutators_arr[@]}"; do
-                        if [[ "$sel_mut" == "$mut_name" ]]; then found=1; break; fi
-                    done
+                    for sel_mut in "${selected_mutators_arr[@]}"; do if [[ "$sel_mut" == "$mut_name" ]]; then found=1; break; fi; done
                     if [[ $found -eq 0 ]]; then available_mutators_to_add+=("$mut_name"); fi
                 done
-
-                if [ ${#available_mutators_to_add[@]} -eq 0 ]; then
-                    echo -e "${YELLOW}All available mutators already selected or list is empty.${NC}"; sleep 1; continue
-                fi
+                if [ ${#available_mutators_to_add[@]} -eq 0 ]; then echo -e "${YELLOW}All available mutators already selected or list is empty.${NC}"; sleep 1; continue; fi
 
                 echo -e "${YELLOW}Select mutators to add (select 'Done' when finished):${NC}"
                 PS3="Add mutator: "
@@ -973,75 +1165,39 @@ _manage_mutators_for_preset() {
                     if [[ "$mut_to_add" == "Done" ]]; then break; fi
                     if [[ -n "$mut_to_add" ]]; then
                         selected_mutators_arr+=("$mut_to_add")
-                        # Remove from available_mutators_to_add for this session of adding
-                        local temp_avail=()
-                        for item in "${available_mutators_to_add[@]}"; do [[ "$item" != "$mut_to_add" ]] && temp_avail+=("$item"); done
+                        local temp_avail=(); for item in "${available_mutators_to_add[@]}"; do [[ "$item" != "$mut_to_add" ]] && temp_avail+=("$item"); done
                         available_mutators_to_add=("${temp_avail[@]}")
-                        echo -e "${GREEN}Added '$mut_to_add'. Current: ${selected_mutators_arr[*]}.${NC}"
-                        if [ ${#available_mutators_to_add[@]} -eq 0 ]; then echo -e "${YELLOW}No more mutators to add.${NC}"; break; fi # Refresh select options
-                        # PS3 needs to be reset if the list changes dynamically for 'select' in some shells
-                        # For simplicity, we break and re-enter if multiple adds are common. Or just inform user.
-                    else
-                        echo -e "${RED}Invalid selection.${NC}"
-                    fi
-                done
-                PS3="Enter your choice: "
+                        echo -e "${GREEN}Added '$mut_to_add'.${NC}"
+                        if [ ${#available_mutators_to_add[@]} -eq 0 ]; then echo -e "${YELLOW}No more mutators to add.${NC}"; break; fi
+                    else echo -e "${RED}Invalid selection.${NC}"; fi
+                done; PS3="Enter your choice: "
                 ;;
-            2) # Remove Mutator
-                if [ ${#selected_mutators_arr[@]} -eq 0 ]; then
-                    echo -e "${RED}No mutators to remove.${NC}"; sleep 1; continue
-                fi
-                echo -e "${YELLOW}Select mutator to remove:${NC}"
-                PS3="Remove mutator: "
+            2)
+                if [ ${#selected_mutators_arr[@]} -eq 0 ]; then echo -e "${RED}No mutators to remove.${NC}"; sleep 1; continue; fi
+                echo -e "${YELLOW}Select mutator to remove:${NC}"; PS3="Remove mutator: "
                 select mut_to_remove in "${selected_mutators_arr[@]}" "Cancel"; do
                     if [[ "$mut_to_remove" == "Cancel" ]]; then break; fi
                     if [[ -n "$mut_to_remove" ]]; then
-                        local temp_arr=()
-                        for item in "${selected_mutators_arr[@]}"; do
-                            if [[ "$item" != "$mut_to_remove" ]]; then temp_arr+=("$item"); fi
-                        done
-                        selected_mutators_arr=("${temp_arr[@]}")
-                        echo -e "${GREEN}Removed '$mut_to_remove'.${NC}"
-                        break
-                    else
-                        echo -e "${RED}Invalid selection.${NC}"
-                    fi
-                done
-                PS3="Enter your choice: "
+                        local temp_arr=(); for item in "${selected_mutators_arr[@]}"; do if [[ "$item" != "$mut_to_remove" ]]; then temp_arr+=("$item"); fi; done
+                        selected_mutators_arr=("${temp_arr[@]}"); echo -e "${GREEN}Removed '$mut_to_remove'.${NC}"; break
+                    else echo -e "${RED}Invalid selection.${NC}"; fi
+                done; PS3="Enter your choice: "
                 ;;
-            3) # Clear All Mutators
+            3)
                 if [ ${#selected_mutators_arr[@]} -gt 0 ]; then
                     read -p "${YELLOW}Are you sure you want to clear all selected mutators? (y/n): ${NC}" confirm_clear
-                    if [[ "$confirm_clear" =~ ^[Yy]$ ]]; then
-                        selected_mutators_arr=()
-                        echo -e "${GREEN}All mutators cleared.${NC}"
-                    else
-                        echo -e "${YELLOW}Clear cancelled.${NC}"
-                    fi
-                else
-                    echo -e "${YELLOW}No mutators to clear.${NC}"
-                fi
-                sleep 1
+                    if [[ "$confirm_clear" =~ ^[Yy]$ ]]; then selected_mutators_arr=(); echo -e "${GREEN}All mutators cleared.${NC}"; else echo -e "${YELLOW}Clear cancelled.${NC}"; fi
+                else echo -e "${YELLOW}No mutators to clear.${NC}"; fi; sleep 1
                 ;;
-            b|B) # Back and Save
-                # Rebuild the -mutators= string
-                if [ ${#selected_mutators_arr[@]} -eq 0 ]; then
-                    _remove_arg_from_array preset_args_ref "-mutators="
-                else
-                    local final_mutators_str
-                    final_mutators_str=$(IFS=,; echo "${selected_mutators_arr[*]}")
-                    _set_arg_in_array preset_args_ref "-mutators=" "$final_mutators_str"
-                fi
-                echo -e "${GREEN}Mutator settings updated for preset.${NC}"; sleep 1
-                return 0
-                ;;
+            b|B)
+                if [ ${#selected_mutators_arr[@]} -eq 0 ]; then _remove_arg_from_array preset_args_ref "-mutators="
+                else local final_mutators_str; final_mutators_str=$(IFS=,; echo "${selected_mutators_arr[*]}"); _set_arg_in_array preset_args_ref "-mutators=" "$final_mutators_str"; fi
+                echo -e "${GREEN}Mutator settings updated for preset.${NC}"; sleep 1; return 0 ;;
             *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
     done
 }
 
-
-# The core preset editor - UPDATED WITH NEW OPTIONS
 _interactive_edit_preset_array() {
     local preset_array_name_var="$1"; local is_new_preset="$2"
     declare -a working_args_copy=()
@@ -1050,12 +1206,13 @@ _interactive_edit_preset_array() {
         working_args_copy=("${existing_preset_ref[@]}")
     else
         if [ ${#working_args_copy[@]} -eq 0 ]; then
-             working_args_copy+=("Farmhouse?Scenario=Scenario_Farmhouse_Checkpoint_Security")
+             working_args_copy+=("Farmhouse?Scenario=Scenario_Farmhouse_Checkpoint_Security") # Default for new
         fi
     fi
 
     declare -A map_params_assoc
     if [ ${#working_args_copy[@]} -eq 0 ] || [[ -z "${working_args_copy[0]}" ]]; then
+        # Ensure a map string exists, even if basic, to prevent errors.
         working_args_copy[0]="Farmhouse?Scenario=Scenario_Farmhouse_Checkpoint_Security"
     fi
     _parse_map_string_to_assoc "${working_args_copy[0]}" map_params_assoc
@@ -1104,7 +1261,7 @@ _interactive_edit_preset_array() {
         read -rp "$temp_ps3" edit_choice
 
         case "$edit_choice" in
-            10) # Edit Map & Scenario
+            10)
                 local available_maps selected_map_name current_map_val="${map_params_assoc["_MAP_NAME_"]}"
                 mapfile -t available_maps < <(_get_unique_maps_from_scenarios)
                 PS3="Select a Map (current: $current_map_val): "; select selected_map_name in "${available_maps[@]}"; do if [[ -n "$selected_map_name" ]]; then map_params_assoc["_MAP_NAME_"]="$selected_map_name"; break; else echo -e "${RED}Invalid selection.${NC}"; fi; done; PS3="Enter your choice: "
@@ -1117,9 +1274,9 @@ _interactive_edit_preset_array() {
                 if [ ${#filtered_scenarios[@]} -eq 0 ]; then echo -e "${RED}No scenarios found for '${map_params_assoc["_MAP_NAME_"]}' mode '$selected_mode_friendly'.${NC}"; read -p "Enter Scenario manually (current '${map_params_assoc["Scenario"]}'): " scenario_input; map_params_assoc["Scenario"]=${scenario_input:-${map_params_assoc["Scenario"]}}; else PS3="Select Scenario (current: ${map_params_assoc["Scenario"]}): "; select selected_scenario in "${filtered_scenarios[@]}"; do if [[ -n "$selected_scenario" ]]; then map_params_assoc["Scenario"]="$selected_scenario"; break; else echo -e "${RED}Invalid selection.${NC}"; fi; done; PS3="Enter your choice: "; fi
                 working_args_copy[0]=$(_build_map_string_from_assoc map_params_assoc)
                 ;;
-            11) read -p "Enter MaxPlayers for map string (current: ${map_params_assoc["MaxPlayers"]}): " map_params_assoc["MaxPlayers"]; working_args_copy[0]=$(_build_map_string_from_assoc map_params_assoc) ;;
+            11) read -p "Enter MaxPlayers for map string (current: ${map_params_assoc["MaxPlayers"]}): " map_val; if [[ -z "$map_val" ]]; then unset map_params_assoc["MaxPlayers"]; else map_params_assoc["MaxPlayers"]="$map_val"; fi; working_args_copy[0]=$(_build_map_string_from_assoc map_params_assoc) ;;
             12) PS3="Select Lighting (current: ${map_params_assoc["Lighting"]}): "; select light_opt in "Day" "Night" "Clear"; do if [[ "$light_opt" == "Clear" ]]; then unset map_params_assoc["Lighting"]; break; fi; if [[ -n "$light_opt" ]]; then map_params_assoc["Lighting"]="$light_opt"; break; else echo -e "${RED}Invalid selection.${NC}"; fi; done; PS3="Enter your choice: "; working_args_copy[0]=$(_build_map_string_from_assoc map_params_assoc) ;;
-            13) read -p "Enter custom query parameter KEY: " custom_key; if [[ -n "$custom_key" ]]; then read -p "Enter value for '$custom_key' (current: ${map_params_assoc[$custom_key]}): " map_params_assoc["$custom_key"]; working_args_copy[0]=$(_build_map_string_from_assoc map_params_assoc); else echo -e "${RED}Key cannot be empty.${NC}"; fi ;;
+            13) read -p "Enter custom query parameter KEY: " custom_key; if [[ -n "$custom_key" ]]; then read -p "Enter value for '$custom_key' (current: ${map_params_assoc[$custom_key]}, blank to remove): " custom_val; if [[ -z "$custom_val" ]]; then unset map_params_assoc["$custom_key"]; else map_params_assoc["$custom_key"]="$custom_val"; fi; working_args_copy[0]=$(_build_map_string_from_assoc map_params_assoc); else echo -e "${RED}Key cannot be empty.${NC}"; fi ;;
 
             20) read -p "Enter Hostname (current: $hostname_val): " new_hn; _set_arg_in_array working_args_copy "-hostname=" "$new_hn" ;;
             21) read -p "Enter Game Port (current: $port_val): " new_port; _set_arg_in_array working_args_copy "-Port=" "$new_port" ;;
@@ -1132,35 +1289,15 @@ _interactive_edit_preset_array() {
             28) selected_mc_file=$(_select_file_from_server_config_dir "Select MapCycle file (current: ${mapcycle_val:-MapCycle.txt})" "MapCycle.txt"); if [[ -n "$selected_mc_file" ]]; then _set_arg_in_array working_args_copy "-MapCycle=" "$selected_mc_file"; else _remove_arg_from_array working_args_copy "-MapCycle="; echo "MapCycle file cleared."; fi ;;
             29) selected_admin_file=$(_select_file_from_server_config_dir "Select AdminList file (current: ${adminlist_val:-Admins.txt})" "Admins.txt"); if [[ -n "$selected_admin_file" ]]; then _set_arg_in_array working_args_copy "-AdminList=" "$selected_admin_file"; else _remove_arg_from_array working_args_copy "-AdminList="; echo "AdminList file cleared."; fi ;;
             30) selected_mods_file=$(_select_file_from_server_config_dir "Select Mods file (current: ${mods_val:-Mods.txt})" "Mods.txt"); if [[ -n "$selected_mods_file" ]]; then _set_arg_in_array working_args_copy "-Mods=" "$selected_mods_file"; else _remove_arg_from_array working_args_copy "-Mods="; echo "Mods file cleared."; fi ;;
-            31) if [[ $modio_en_idx -ne -1 ]]; then _remove_arg_from_array working_args_copy "-EnableModIO" "true"; _set_arg_in_array working_args_copy "-DisableModIO" "" "true"; echo "Mod.io Disabled."; elif [[ $modio_dis_idx -ne -1 ]]; then _remove_arg_from_array working_args_copy "-DisableModIO" "true"; echo "Mod.io set to default (Enabled)."; else _set_arg_in_array working_args_copy "-EnableModIO" "" "true"; echo "Mod.io Enabled."; fi ;;
+            31) if [[ $modio_en_idx -ne -1 ]]; then _remove_arg_from_array working_args_copy "-EnableModIO" "true"; _set_arg_in_array working_args_copy "-DisableModIO" "" "true"; echo "Mod.io Explicitly Disabled."; elif [[ $modio_dis_idx -ne -1 ]]; then _remove_arg_from_array working_args_copy "-DisableModIO" "true"; echo "Mod.io set to default (Effectively Enabled)."; else _set_arg_in_array working_args_copy "-EnableModIO" "" "true"; echo "Mod.io Explicitly Enabled."; fi ;;
             32) _toggle_flag_in_array working_args_copy "-log" ;;
 
-            35) # GSLT Token
-                read -p "Enter GSLT Token (-GSLTToken, current: ${gslttoken_val:-Not Set}): " new_gslt_token
-                if [[ -n "$new_gslt_token" ]]; then _set_arg_in_array working_args_copy "-GSLTToken=" "$new_gslt_token"
-                else _remove_arg_from_array working_args_copy "-GSLTToken="; echo "GSLT Token cleared."; fi
-                ;;
-            36) # Toggle GameStats Reporting
-                _toggle_flag_in_array working_args_copy "-GameStats"
-                ;;
-            37) # GameStats Token
-                read -p "Enter GameStats Token (-GameStatsToken, current: ${statstoken_val:-Not Set}): " new_stats_token
-                if [[ -n "$new_stats_token" ]]; then _set_arg_in_array working_args_copy "-GameStatsToken=" "$new_stats_token"
-                else _remove_arg_from_array working_args_copy "-GameStatsToken="; echo "GameStats Token cleared."; fi
-                ;;
+            35) read -p "Enter GSLT Token (-GSLTToken, current: ${gslttoken_val:-Not Set}): " new_gslt_token; if [[ -n "$new_gslt_token" ]]; then _set_arg_in_array working_args_copy "-GSLTToken=" "$new_gslt_token"; else _remove_arg_from_array working_args_copy "-GSLTToken="; echo "GSLT Token cleared."; fi ;;
+            36) _toggle_flag_in_array working_args_copy "-GameStats" ;;
+            37) read -p "Enter GameStats Token (-GameStatsToken, current: ${statstoken_val:-Not Set}): " new_stats_token; if [[ -n "$new_stats_token" ]]; then _set_arg_in_array working_args_copy "-GameStatsToken=" "$new_stats_token"; else _remove_arg_from_array working_args_copy "-GameStatsToken="; echo "GameStats Token cleared."; fi ;;
 
-            40) # Toggle Official Rules
-                if [[ "$ruleset_val" == "OfficialRules" ]]; then # Currently enabled, so disable
-                    _remove_arg_from_array working_args_copy "-ruleset="
-                    echo "'-ruleset=OfficialRules' disabled."
-                else # Currently disabled or different, so enable
-                    _set_arg_in_array working_args_copy "-ruleset=" "OfficialRules"
-                    echo "'-ruleset=OfficialRules' enabled."
-                fi
-                ;;
-            41) # Manage Mutators
-                _manage_mutators_for_preset working_args_copy # Pass nameref
-                ;;
+            40) if [[ "$ruleset_val" == "OfficialRules" ]]; then _remove_arg_from_array working_args_copy "-ruleset="; echo "'-ruleset=OfficialRules' disabled."; else _set_arg_in_array working_args_copy "-ruleset=" "OfficialRules"; echo "'-ruleset=OfficialRules' enabled."; fi ;;
+            41) _manage_mutators_for_preset working_args_copy ;;
 
             A|a) read -p "Enter custom argument (e.g., -bBots=1 or -MyFlag): " custom_arg; if [[ -n "$custom_arg" ]]; then if [[ "$custom_arg" == *"="* ]]; then local key_part="${custom_arg%%=*}="; local val_part="${custom_arg#*=}"; _set_arg_in_array working_args_copy "$key_part" "$val_part"; else _set_arg_in_array working_args_copy "$custom_arg" "" "true"; fi; echo "Arg '$custom_arg' set/added."; else echo -e "${RED}Arg empty.${NC}"; fi ;;
             R|r)
@@ -1179,11 +1316,11 @@ _interactive_edit_preset_array() {
             B|b) echo -e "${YELLOW}Changes to '${preset_array_name_var/_args/}' discarded.${NC}"; sleep 1; return 1 ;;
             *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
-        _parse_map_string_to_assoc "${working_args_copy[0]}" map_params_assoc
+        # Re-parse map string in case it was changed by options 10-13 or directly if it's ever allowed
+         _parse_map_string_to_assoc "${working_args_copy[0]}" map_params_assoc
     done
 }
 
-# (Other preset management functions: _create_new_preset, _edit_existing_preset, _clone_existing_preset, _delete_existing_preset, _save_all_presets_to_file unchanged)
 _create_new_preset() {
     local new_preset_name
     while true; do
@@ -1259,18 +1396,19 @@ EOL
     for arr_name in "${preset_array_vars[@]}"; do
         declare -n current_arr_ref="$arr_name"; echo "$arr_name=(" >> "$PRESETS_FILE"
         for item in "${current_arr_ref[@]}"; do
-            if [[ "$item" == *" "* || "$item" == *'"'* || "$item" == *"'"* || "$item" == *"$"* || "$item" == *"!"* ]]; then printf '  "%s"\n' "$(echo "$item" | sed 's/"/\\"/g')" >> "$PRESETS_FILE"; else printf '  %s\n' "$item" >> "$PRESETS_FILE"; fi
+            # Improved quoting for items with special characters
+            printf '  %s\n' "$(printf '%q' "$item")" >> "$PRESETS_FILE"
         done; echo ")" >> "$PRESETS_FILE"; echo "" >> "$PRESETS_FILE"
     done; echo -e "${GREEN}Presets saved successfully to $PRESETS_FILE${NC}"
 }
 
-
-manage_startup_presets() { # Main preset manager (unchanged structurally)
+manage_startup_presets() {
     if [ ! -f "$PRESETS_FILE" ]; then
         echo -e "${YELLOW}'$PRESETS_FILE' not found.${NC}"
         read -p "Create a default presets file? (y/n): " create_choice
         if [[ "$create_choice" =~ ^[Yy]$ ]]; then create_presets_file; else echo -e "${RED}Cannot manage presets without presets file.${NC}"; sleep 1; return; fi
     fi
+    # shellcheck source=/dev/null
     source "$PRESETS_FILE" # Load presets into current shell
 
     while true; do
@@ -1300,7 +1438,6 @@ manage_startup_presets() { # Main preset manager (unchanged structurally)
         esac
     done
 }
-
 # END: Advanced Preset Management Functions
 
 configure_firewall() { # Unchanged
@@ -1312,18 +1449,20 @@ configure_firewall() { # Unchanged
 }
 
 
-# --- Main Menu (unchanged) ---
+# --- Main Menu ---
 show_menu() {
     clear
     echo "================================================="
-    echo "  Insurgency: Sandstorm Server Manager (v1.7)"
+    echo "  Insurgency: Sandstorm Server Manager (v1.8)"
     echo "================================================="
-    status_server
+    status_server # Display status, including watchdog
     echo "-------------------------------------------------"
-    echo -e "${GREEN}1) Start Server${NC}"
-    echo -e "${RED}2) Stop Server${NC}"
-    echo -e "${CYAN}3) View Server Console${NC}"
-    echo -e "${YELLOW}4) Test-Run a Preset (Debug Startups)${NC}"
+    echo -e "${GREEN}1)  Start Server (Manual Mode)${NC}"
+    echo -e "${GREEN}1W) Start Server with Watchdog${NC}"
+    echo -e "${RED}2)  Stop Server (if not watchdogged)${NC}"
+    echo -e "${RED}2W) Stop Server & Watchdog${NC}"
+    echo -e "${CYAN}3)  View Server Console${NC}"
+    echo -e "${YELLOW}4)  Test-Run a Preset (Debug Startups)${NC}"
     echo "-------------------------------------------------"
     echo "5) Install/Validate Server Files"
     echo "6) Update Server Files"
@@ -1337,7 +1476,7 @@ show_menu() {
     echo ""
 }
 
-# --- Main Loop (unchanged) ---
+# --- Main Loop ---
 while true; do
     show_menu
     echo -e -n "${YELLOW}Enter your choice: ${NC}"
@@ -1345,7 +1484,9 @@ while true; do
 
     case "$choice" in
         1) start_server ;;
+        "1W"|"1w") start_server_with_watchdog ;;
         2) stop_server ;;
+        "2W"|"2w") stop_watchdog_and_server ;;
         3) view_console ;;
         4) test_run_server ;;
         5) install_dependencies; install_steamcmd; install_sandstorm ;;
@@ -1358,7 +1499,23 @@ while true; do
         *) echo -e "${RED}Invalid option, please try again.${NC}" ;;
     esac
 
-    if [[ "$choice" != "3" && "$choice" != "4" && "$choice" != "q" && "$choice" != "7" && "$choice" != "8" && "$choice" != "9" ]]; then
-        read -p "Press [Enter] to continue..."
+    # Don't pause for menu-driven or quick actions
+    if [[ ! "$choice" =~ ^(q|3|4|7|8|9|1w|2w|1W|2W)$ ]]; then
+        # Also avoid pause if choice was invalid
+        if [[ "$choice" =~ ^[1256]$ || "$choice" == "10" ]]; then # Valid choices that aren't menu-driven
+             read -p "Press [Enter] to continue..."
+        fi
     fi
 done
+
+# Clean up watchdog PID file if script exits and watchdog was managed by it
+if [ -f "$WATCHDOG_PID_FILE" ]; then
+    wd_pid_on_exit=$(cat "$WATCHDOG_PID_FILE")
+    # Check if the script itself is the parent of the watchdog, or if watchdog is still running
+    # This is a simple check; a more robust check might involve checking PPID if the watchdog is truly detached.
+    # For now, if the watchdog process is dead, clean up.
+    if ! ps -p "$wd_pid_on_exit" > /dev/null; then
+        echo -e "${YELLOW}Cleaning up stale watchdog PID file on exit...${NC}"
+        rm -f "$WATCHDOG_PID_FILE" "$LAST_LAUNCHED_PRESET_FILE"
+    fi
+fi
