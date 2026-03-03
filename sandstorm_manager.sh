@@ -2,8 +2,8 @@
 
 #================================================================
 # Insurgency: Sandstorm - Linux Server Management Script
-# Author: AI Assistant
-# Version: 1.8 - Added Watchdog Functionality
+# Author: ExtremelyStiff
+# Version: 1.9 - Added MOD.IO Server Authorization Support
 #================================================================
 
 # --- Script Configuration ---
@@ -28,6 +28,12 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
+
+# --- MOD.IO Configuration ---
+MODIO_API_KEY="bbf3af200848aef28418c032a601e7a2"
+MODIO_AUTH_URL="https://g-254.modapi.io/v1/oauth/emailrequest"
+MODIO_CACHE_DIR="$HOME/.modio"
+SAVED_SECURITY_CODE_FILE="$HOME/.sandstorm_security_code.txt"
 
 # --- Master Scenario List (unchanged) ---
 SCENARIO_LIST=$(cat << "EOF"
@@ -322,6 +328,25 @@ create_presets_file() {
 # )
 #
 # Note the _args suffix on the variable name. It is required.
+#
+# --- MOD.IO / MOD SUPPORT ---
+# To run mods, you MUST:
+# 1. Authorize server with MOD.IO (Menu Option 11)
+# 2. Add the -mods flag to your preset
+# 3. Use -SecurityCode=YOUR_CODE (or -SecurityCode=none after first auth)
+# 4. Use -ModDownloadTravelTo=MAP_NAME?Scenario=SCENARIO_NAME for modded maps
+#
+# Example modded preset:
+# MyModdedServer_args=(
+#   "Mod_Test?Scenario=Scenario_Mod_Test?MaxPlayers=16"
+#   "-mods"
+#   "-SecurityCode=none"
+#   "-ModDownloadTravelTo=Mod_Test?Scenario=Scenario_Mod_Test?Password=123"
+#   "-Port=27102"
+#   "-QueryPort=27131"
+#   "-log"
+#   "-hostname=My Modded Server"
+# )
 
 DefaultCoop_args=(
   "Farmhouse?Scenario=Scenario_Farmhouse_Checkpoint_Security?MaxPlayers=8"
@@ -364,6 +389,93 @@ _display_map_cycle_content_simple() {
         echo "$((i+1))) ${lines_to_display[$i]}"
     done
     echo "-------------------------"
+}
+
+# --- MOD.IO Server Authorization ---
+# Required for running mods on the server
+authorize_modio_server() {
+    echo -e "${CYAN}--- MOD.IO Server Authorization ---${NC}"
+    echo -e "${YELLOW}This is required to run mods on your server.${NC}"
+    echo "You must have a MOD.IO account registered with the same email."
+    echo ""
+    
+    # Check if already authorized
+    if [ -f "$SAVED_SECURITY_CODE_FILE" ]; then
+        local saved_code
+        saved_code=$(cat "$SAVED_SECURITY_CODE_FILE")
+        echo -e "${GREEN}Found saved security code: $saved_code${NC}"
+        read -p "Use this code? (y/n): " use_saved
+        if [[ "$use_saved" =~ ^[Yy]$ ]]; then
+            echo -e "${GREEN}Using saved code.${NC}"
+            return 0
+        fi
+    fi
+    
+    read -p "Enter your MOD.IO registered email: " modio_email
+    if [[ -z "$modio_email" ]]; then
+        echo -e "${RED}Email cannot be empty.${NC}"
+        return 1
+    fi
+    
+    echo -e "${YELLOW}Requesting authorization code...${NC}"
+    
+    # Make the API request
+    local response
+    response=$(curl -s -L -X POST "$MODIO_AUTH_URL?api_key=$MODIO_API_KEY" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -H "Accept: application/json" \
+        -d "email=$modio_email")
+    
+    # Check for errors in response
+    if echo "$response" | grep -q '"error"'; then
+        local error_msg
+        error_msg=$(echo "$response" | grep -o '"message":"[^"]*"' | cut -d'"' -f4)
+        echo -e "${RED}Error: $error_msg${NC}"
+        return 1
+    fi
+    
+    if echo "$response" | grep -q '"message"'; then
+        local success_msg
+        success_msg=$(echo "$response" | grep -o '"message":"[^"]*"' | cut -d'"' -f4)
+        echo -e "${GREEN}$success_msg${NC}"
+        echo ""
+        echo -e "${YELLOW}Please check your email for the security code.${NC}"
+        read -p "Enter the security code from email: " security_code
+        
+        if [[ -z "$security_code" ]]; then
+            echo -e "${RED}Security code cannot be empty.${NC}"
+            return 1
+        fi
+        
+        # Save the security code
+        echo "$security_code" > "$SAVED_SECURITY_CODE_FILE"
+        echo -e "${GREEN}Security code saved to $SAVED_SECURITY_CODE_FILE${NC}"
+        echo -e "${GREEN}Server authorized successfully!${NC}"
+        return 0
+    fi
+    
+    echo -e "${RED}Unexpected response from MOD.IO: $response${NC}"
+    return 1
+}
+
+clear_modio_auth() {
+    if [ -f "$SAVED_SECURITY_CODE_FILE" ]; then
+        read -p "Remove saved MOD.IO security code? (y/n): " confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            rm -f "$SAVED_SECURITY_CODE_FILE"
+            echo -e "${GREEN}MOD.IO authorization cleared.${NC}"
+        fi
+    else
+        echo -e "${YELLOW}No saved MOD.IO authorization found.${NC}"
+    fi
+}
+
+get_security_code() {
+    if [ -f "$SAVED_SECURITY_CODE_FILE" ]; then
+        cat "$SAVED_SECURITY_CODE_FILE"
+    else
+        echo "none"
+    fi
 }
 
 # --- Installation and Updates (unchanged) ---
@@ -464,6 +576,41 @@ _start_server_core() {
         fi
     fi
     declare -n args_array="$preset_array_name" # Bash 4.3+ nameref
+
+    # Check if mods are enabled in the preset, and handle SecurityCode automatically
+    local mods_enabled=false
+    for arg in "${args_array[@]}"; do
+        if [[ "$arg" == "-mods" ]]; then
+            mods_enabled=true
+            break
+        fi
+    done
+
+    if [[ "$mods_enabled" == "true" ]]; then
+        echo "$log_prefix Mods enabled in preset. Checking security code..." | tee -a "$WATCHDOG_LOG_FILE"
+        
+        # Check if SecurityCode is already set
+        local security_code_set=false
+        for arg in "${args_array[@]}"; do
+            if [[ "$arg" == *"-SecurityCode="* ]]; then
+                security_code_set=true
+                break
+            fi
+        done
+        
+        if [[ "$security_code_set" == "false" ]]; then
+            # Try to get the saved security code
+            local saved_code
+            saved_code=$(get_security_code)
+            if [[ "$saved_code" != "none" && -n "$saved_code" ]]; then
+                echo "$log_prefix Using saved security code for mod support." | tee -a "$WATCHDOG_LOG_FILE"
+                args_array+=("-SecurityCode=$saved_code")
+            else
+                echo "$log_prefix WARNING: Mods enabled but no SecurityCode set or found." | tee -a "$WATCHDOG_LOG_FILE"
+                echo "$log_prefix Use Menu Option 11 to authorize server with MOD.IO first!" | tee -a "$WATCHDOG_LOG_FILE"
+            fi
+        fi
+    fi
 
     if ! cd "$SERVER_DIR"; then
         echo "$log_prefix ${RED}CRITICAL: Failed to cd to $SERVER_DIR for preset $preset_array_name${NC}" | tee -a "$WATCHDOG_LOG_FILE"
@@ -1242,6 +1389,10 @@ _interactive_edit_preset_array() {
         local modio_status_str="Default (Enabled)"; local modio_en_idx=$(_find_arg_index_in_array working_args_copy "-EnableModIO" "true"); local modio_dis_idx=$(_find_arg_index_in_array working_args_copy "-DisableModIO" "true")
         if [[ $modio_en_idx -ne -1 ]]; then modio_status_str="Explicitly Enabled"; elif [[ $modio_dis_idx -ne -1 ]]; then modio_status_str="Explicitly Disabled"; fi
         echo -e "   31) Mod.io            : ${YELLOW}${modio_status_str}${NC}"
+        echo -e " [ MOD.IO Server Mod Support ]"
+        local mods_flag_idx=$(_find_arg_index_in_array working_args_copy "-mods" "true"); local mods_flag_status=$([[ $mods_flag_idx -ne -1 ]] && echo "Enabled" || echo "Disabled"); echo -e "   33) Enable Mods (-mods) : ${YELLOW}${mods_flag_status}${NC}"
+        local securitycode_val=$(_get_arg_value_from_array working_args_copy "-SecurityCode="); echo -e "   34) Security Code      : ${YELLOW}${securitycode_val:-none (use code on first run)}${NC}"
+        local moddownload_val=$(_get_arg_value_from_array working_args_copy "-ModDownloadTravelTo="); echo -e "   35) Mod Download Map  : ${YELLOW}${moddownload_val:-Not Set}${NC}"
         local log_idx=$(_find_arg_index_in_array working_args_copy "-log" "true"); local log_status=$([[ $log_idx -ne -1 ]] && echo "Enabled" || echo "Disabled"); echo -e "   32) Logging (-log)    : ${YELLOW}${log_status}${NC}"
         echo " [ Server Authentication & Stats ]"
         local gslttoken_val=$(_get_arg_value_from_array working_args_copy "-GSLTToken="); echo -e "   35) GSLT Token        : ${YELLOW}${gslttoken_val:-Not Set}${NC}"
@@ -1291,10 +1442,38 @@ _interactive_edit_preset_array() {
             30) selected_mods_file=$(_select_file_from_server_config_dir "Select Mods file (current: ${mods_val:-Mods.txt})" "Mods.txt"); if [[ -n "$selected_mods_file" ]]; then _set_arg_in_array working_args_copy "-Mods=" "$selected_mods_file"; else _remove_arg_from_array working_args_copy "-Mods="; echo "Mods file cleared."; fi ;;
             31) if [[ $modio_en_idx -ne -1 ]]; then _remove_arg_from_array working_args_copy "-EnableModIO" "true"; _set_arg_in_array working_args_copy "-DisableModIO" "" "true"; echo "Mod.io Explicitly Disabled."; elif [[ $modio_dis_idx -ne -1 ]]; then _remove_arg_from_array working_args_copy "-DisableModIO" "true"; echo "Mod.io set to default (Effectively Enabled)."; else _set_arg_in_array working_args_copy "-EnableModIO" "" "true"; echo "Mod.io Explicitly Enabled."; fi ;;
             32) _toggle_flag_in_array working_args_copy "-log" ;;
+            
+            33) _toggle_flag_in_array working_args_copy "-mods" ;;
+            34) 
+                echo -e "${CYAN}Security Code Configuration${NC}"
+                echo "Use your authorization code from email on first run."
+                echo "After first run, use 'none' for subsequent launches."
+                read -p "Enter Security Code (current: ${securitycode_val:-none}): " new_sec_code
+                if [[ -n "$new_sec_code" ]]; then 
+                    _set_arg_in_array working_args_copy "-SecurityCode=" "$new_sec_code"
+                    echo "Security Code set."
+                else 
+                    _remove_arg_from_array working_args_copy "-SecurityCode="
+                    echo "Security Code cleared."
+                fi 
+                ;;
+            35) 
+                echo -e "${CYAN}Mod Download Travel To Configuration${NC}"
+                echo "This is used to specify a map to travel to after mods are downloaded."
+                echo "Format: MAP_NAME?Scenario=SCENARIO_NAME?Password=YOUR_PASSWORD"
+                read -p "Enter ModDownloadTravelTo (current: ${moddownload_val:-Not Set}): " new_moddownload
+                if [[ -n "$new_moddownload" ]]; then 
+                    _set_arg_in_array working_args_copy "-ModDownloadTravelTo=" "$new_moddownload"
+                    echo "ModDownloadTravelTo set."
+                else 
+                    _remove_arg_from_array working_args_copy "-ModDownloadTravelTo="
+                    echo "ModDownloadTravelTo cleared."
+                fi 
+                ;;
 
-            35) read -p "Enter GSLT Token (-GSLTToken, current: ${gslttoken_val:-Not Set}): " new_gslt_token; if [[ -n "$new_gslt_token" ]]; then _set_arg_in_array working_args_copy "-GSLTToken=" "$new_gslt_token"; else _remove_arg_from_array working_args_copy "-GSLTToken="; echo "GSLT Token cleared."; fi ;;
-            36) _toggle_flag_in_array working_args_copy "-GameStats" ;;
-            37) read -p "Enter GameStats Token (-GameStatsToken, current: ${statstoken_val:-Not Set}): " new_stats_token; if [[ -n "$new_stats_token" ]]; then _set_arg_in_array working_args_copy "-GameStatsToken=" "$new_stats_token"; else _remove_arg_from_array working_args_copy "-GameStatsToken="; echo "GameStats Token cleared."; fi ;;
+            36) read -p "Enter GSLT Token (-GSLTToken, current: ${gslttoken_val:-Not Set}): " new_gslt_token; if [[ -n "$new_gslt_token" ]]; then _set_arg_in_array working_args_copy "-GSLTToken=" "$new_gslt_token"; else _remove_arg_from_array working_args_copy "-GSLTToken="; echo "GSLT Token cleared."; fi ;;
+            37) _toggle_flag_in_array working_args_copy "-GameStats" ;;
+            38) read -p "Enter GameStats Token (-GameStatsToken, current: ${statstoken_val:-Not Set}): " new_stats_token; if [[ -n "$new_stats_token" ]]; then _set_arg_in_array working_args_copy "-GameStatsToken=" "$new_stats_token"; else _remove_arg_from_array working_args_copy "-GameStatsToken="; echo "GameStats Token cleared."; fi ;;
 
             40) if [[ "$ruleset_val" == "OfficialRules" ]]; then _remove_arg_from_array working_args_copy "-ruleset="; echo "'-ruleset=OfficialRules' disabled."; else _set_arg_in_array working_args_copy "-ruleset=" "OfficialRules"; echo "'-ruleset=OfficialRules' enabled."; fi ;;
             41) _manage_mutators_for_preset working_args_copy ;;
@@ -1453,7 +1632,7 @@ configure_firewall() { # Unchanged
 show_menu() {
     clear
     echo "================================================="
-    echo "  Insurgency: Sandstorm Server Manager (v1.8)"
+    echo "  Insurgency: Sandstorm Server Manager (v1.9)"
     echo "================================================="
     status_server # Display status, including watchdog
     echo "-------------------------------------------------"
@@ -1471,6 +1650,9 @@ show_menu() {
     echo "8) Edit Configuration Files (Admins, etc.)"
     echo "9) Advanced Map Cycle Generator"
     echo "10) Configure Firewall (UFW)"
+    echo -e "-------------------------------------------------"
+    echo -e "${CYAN}11) MOD.IO Server Authorization${NC} (Required for mods)"
+    echo -e "${YELLOW}12) Clear MOD.IO Authorization${NC}"
     echo -e "-------------------------------------------------"
     echo "q) Quit"
     echo ""
@@ -1495,12 +1677,14 @@ while true; do
         8) edit_config_menu ;;
         9) generate_map_cycle ;;
         10) configure_firewall ;;
+        11) authorize_modio_server ;;
+        12) clear_modio_auth ;;
         q) echo "Exiting."; break ;;
         *) echo -e "${RED}Invalid option, please try again.${NC}" ;;
     esac
 
     # Don't pause for menu-driven or quick actions
-    if [[ ! "$choice" =~ ^(q|3|4|7|8|9|1w|2w|1W|2W)$ ]]; then
+    if [[ ! "$choice" =~ ^(q|3|4|7|8|9|11|12|1w|2w|1W|2W)$ ]]; then
         # Also avoid pause if choice was invalid
         if [[ "$choice" =~ ^[1256]$ || "$choice" == "10" ]]; then # Valid choices that aren't menu-driven
              read -p "Press [Enter] to continue..."
